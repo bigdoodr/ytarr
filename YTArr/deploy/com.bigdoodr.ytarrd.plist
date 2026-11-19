@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Headless alternative to the menu-bar app. Copy ytarrd to /usr/local/bin, edit the password,
+     then: cp this file ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.bigdoodr.ytarrd.plist -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.bigdoodr.ytarrd</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/ytarrd</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>YTARR_BIND</key><string>0.0.0.0</string>
+    <key>YTARR_PORT</key><string>8686</string>
+    <key>YTARR_PASSWORD</key><string>CHANGE-ME</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/ytarrd.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ytarrd.log</string>
+</dict></plist>
