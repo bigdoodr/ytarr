@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ServiceManagement
+import UserNotifications
 import YTArrCore
 
 /// Menu-bar host: runs the YTArr server in-process.
@@ -12,9 +13,12 @@ struct MyApp: App {
         MenuBarExtra {
             MenuContent(host: host)
         } label: {
-            Image(systemName: host.status?.running != nil ? "arrow.down.circle.fill" : "arrow.down.circle")
+            Image("MenuBarIcon")
         }
         .menuBarExtraStyle(.menu)
+
+        Window("YTArr Settings", id: "settings") { SettingsView() }
+            .windowResizability(.contentSize)
     }
 }
 
@@ -30,26 +34,36 @@ final class ServerHost {
     @ObservationIgnored private var serverTask: Task<Void, Never>?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var activity: NSObjectProtocol?
+    @ObservationIgnored private var downloadActivity: NSObjectProtocol?
 
     var url: URL { URL(string: "http://\(config.bind == "0.0.0.0" ? "localhost" : config.bind):\(config.port)")! }
 
     init() {
-        let d = UserDefaults.standard
-        let lan = d.bool(forKey: "listenOnLAN")
-        config = WebConfig(bind: lan ? "0.0.0.0" : "127.0.0.1",
-                           port: d.integer(forKey: "port") == 0 ? 8686 : d.integer(forKey: "port"),
-                           password: d.string(forKey: "password"))
+        ServerPrefs.migrateLegacyPassword()
+        Notifier.requestAuthorization()
+        let lan = ServerPrefs.listenOnLAN
+        // LAN access without a password is never allowed.
+        let pw = ServerPrefs.password
+        let bindLAN = lan && !pw.isEmpty
+        config = WebConfig(bind: bindLAN ? "0.0.0.0" : "127.0.0.1", port: ServerPrefs.port, password: pw.isEmpty ? nil : pw, username: ServerPrefs.username)
         engine = Engine(store: store)
         // Stay responsive for scheduled checks (no App Nap) but still let the Mac idle-sleep.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep, .automaticTerminationDisabled, .suddenTerminationDisabled],
             reason: "YTArr scheduled downloads")
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { [engine] _ in
+            // Stop yt-dlp children before we exit (wait briefly; the engine is its own actor).
+            let sem = DispatchSemaphore(value: 0)
+            Task.detached { await engine.stop(); sem.signal() }
+            _ = sem.wait(timeout: .now() + 2)
+        }
         start()
     }
 
     private func start() {
         let (store, engine, config) = (store, engine, config)
         serverTask = Task {
+            await engine.setNotifier { notice in Notifier.send(notice) }
             await engine.start()
             do { try await runWebServer(store: store, engine: engine, config: config) }
             catch { await MainActor.run { self.error = "Server stopped: \(error.localizedDescription)" } }
@@ -57,9 +71,18 @@ final class ServerHost {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 let s = await engine.status()
-                await MainActor.run { self?.status = s }
+                await MainActor.run { self?.status = s; self?.updateSleepAssertion(busy: s.running != nil || s.updating) }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
+        }
+    }
+
+    /// While a download is running, keep the Mac from idle-sleeping so it finishes.
+    private func updateSleepAssertion(busy: Bool) {
+        if busy, downloadActivity == nil {
+            downloadActivity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled], reason: "YTArr downloading")
+        } else if !busy, let a = downloadActivity {
+            ProcessInfo.processInfo.endActivity(a); downloadActivity = nil
         }
     }
 
@@ -70,6 +93,7 @@ final class ServerHost {
 
 struct MenuContent: View {
     let host: ServerHost
+    @Environment(\.openWindow) private var openWindow
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
@@ -80,11 +104,13 @@ struct MenuContent: View {
             else { Text("Idle") }
             if !s.queued.isEmpty { Text("Queued: \(s.queued.count)") }
             Text(s.ytdlpVersion.map { "yt-dlp \($0)" } ?? "yt-dlp not installed yet")
+            if s.ffmpegDir == nil { Text("Warning: ffmpeg not found (brew install ffmpeg)") }
         }
         Divider()
         Button("Open Web UI") { host.openUI() }.keyboardShortcut("o")
         Button("Check All Sources Now") { host.checkAll() }
         Button("Update yt-dlp Now") { host.updateYtDlp() }
+        Button("Settings...") { NSApplication.shared.activate(ignoringOtherApps: true); openWindow(id: "settings") }.keyboardShortcut(",")
         Divider()
         Toggle("Launch at Login", isOn: $launchAtLogin)
             .onChange(of: launchAtLogin) { _, on in
@@ -93,5 +119,23 @@ struct MenuContent: View {
             }
         Divider()
         Button("Quit YTArr") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
+    }
+}
+
+/// Posts system notifications for the engine's notices (new downloads, sources that start failing).
+enum Notifier {
+    static var enabled: Bool { UserDefaults.standard.object(forKey: "notify") as? Bool ?? true }
+
+    static func requestAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    static func send(_ notice: Engine.Notice) {
+        guard enabled else { return }
+        let c = UNMutableNotificationContent()
+        c.title = notice.title
+        c.body = notice.body
+        if notice.kind == .problem { c.sound = .default }
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
     }
 }

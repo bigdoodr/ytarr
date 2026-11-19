@@ -24,6 +24,11 @@ public actor Store {
                         s.profiles[i].nfoStyle = b.nfoStyle; s.profiles[i].writeThumbnail = b.writeThumbnail
                     }
                 }
+                for i in s.profiles.indices where s.profiles[i].albumTag == nil && s.profiles[i].artistTag == nil {
+                    if let b = Profile.builtins.first(where: { $0.id == s.profiles[i].id }) {
+                        s.profiles[i].albumTag = b.albumTag; s.profiles[i].artistTag = b.artistTag
+                    }
+                }
                 state = s; return
             }
             // Unreadable state: keep a copy rather than silently overwriting it.

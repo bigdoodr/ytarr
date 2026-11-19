@@ -3,17 +3,28 @@ import Hummingbird
 import HTTPTypes
 import NIOCore
 
-struct BasicAuth<Context: RequestContext>: RouterMiddleware {
-    let password: String
+/// Blocks cross-site form posts (CSRF) and DNS-rebinding: the Host must be a loopback name when bound to
+/// loopback, and every state-changing request must come from a page on this same host.
+struct OriginGuard<Context: RequestContext>: RouterMiddleware {
+    let loopbackOnly: Bool
+    static func hostOnly(_ h: String) -> String {
+        var x = h.lowercased()
+        if x.hasPrefix("[") { if let e = x.firstIndex(of: "]") { return String(x[x.startIndex...e]) } }
+        if let c = x.firstIndex(of: ":") { x = String(x[x.startIndex..<c]) }
+        return x
+    }
     func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
-        if let h = request.headers[.authorization], h.hasPrefix("Basic "),
-           let data = Data(base64Encoded: String(h.dropFirst(6))),
-           let cred = String(data: data, encoding: .utf8),
-           let colon = cred.firstIndex(of: ":"),
-           String(cred[cred.index(after: colon)...]) == password {
-            return try await next(request, context)
+        let host = request.head.authority.map(Self.hostOnly) ?? ""
+        if loopbackOnly, !["localhost", "127.0.0.1", "[::1]"].contains(host) {
+            return Response(status: .forbidden)
         }
-        return Response(status: .unauthorized, headers: [.wwwAuthenticate: "Basic realm=\"YTArr\""])
+        if request.method != .get && request.method != .head {
+            let src = request.headers[.origin] ?? request.headers[.referer]
+            guard let src, let u = URL(string: src), let h = u.host else { return Response(status: .forbidden) }
+            let sh = h.contains(":") ? "[\(h.lowercased())]" : h.lowercased()
+            if sh != host { return Response(status: .forbidden) }
+        }
+        return try await next(request, context)
     }
 }
 
@@ -21,8 +32,9 @@ public struct WebConfig: Sendable {
     public var bind: String
     public var port: Int
     public var password: String?
-    public init(bind: String = "127.0.0.1", port: Int = 8686, password: String? = nil) {
-        self.bind = bind; self.port = port; self.password = password
+    public var username: String
+    public init(bind: String = "127.0.0.1", port: Int = 8686, password: String? = nil, username: String = "admin") {
+        self.bind = bind; self.port = port; self.password = password; self.username = username
     }
 }
 
@@ -39,11 +51,51 @@ private func form(_ request: Request) async throws -> Form {
 }
 
 /// Builds the router for the web UI.
-public func makeRouter(store: Store, engine: Engine, password: String?) -> Router<BasicRequestContext> {
+public func makeRouter(store: Store, engine: Engine, password: String?, username: String = "admin", loopbackOnly: Bool = true) -> Router<BasicRequestContext> {
     let router = Router(context: BasicRequestContext.self)
-    if let pw = password, !pw.isEmpty { router.add(middleware: BasicAuth(password: pw)) }
+    router.add(middleware: OriginGuard(loopbackOnly: loopbackOnly))
+    let auth = AuthState()
+    let authOn = !(password ?? "").isEmpty
+    let loginName = username.isEmpty ? "admin" : username
+    H.showSignOut = authOn
+    if authOn { router.add(middleware: FormsAuth(username: loginName, password: password ?? "", state: auth)) }
 
     @Sendable func uuid(_ ctx: BasicRequestContext) -> UUID? { ctx.parameters.get("id").flatMap(UUID.init(uuidString:)) }
+
+    // ---- Sign in / out ("Forms (Login Page)")
+    router.get("/login") { request, _ in
+        let next = safeNextPath(request.uri.queryParameters["next"].map(String.init) ?? "/")
+        if !authOn { return redirect("/") }
+        if let t = request.cookies[AuthState.cookieName]?.value, auth.isValid(t) { return redirect(next) }
+        return html(H.loginPage(error: nil, next: next))
+    }
+    router.post("/login") { request, _ in
+        guard authOn else { return redirect("/") }
+        let f = try await form(request)
+        let next = safeNextPath(f.str("next"))
+        if let wait = auth.lockoutRemaining() {
+            return html(H.loginPage(error: "Too many failed attempts. Try again in \(wait) seconds.", next: next), status: .tooManyRequests)
+        }
+        let userOK = AuthState.secureEqual(f.str("username"), loginName)
+        let passOK = AuthState.secureEqual(f.raw("password"), password ?? "")
+        guard userOK && passOK else {
+            auth.recordFailure()
+            try? await Task.sleep(nanoseconds: 1_000_000_000)   // slows down guessing
+            return html(H.loginPage(error: "Incorrect username or password.", next: next), status: .unauthorized)
+        }
+        let remember = f.bool("remember")
+        let lifetime: TimeInterval = remember ? 30 * 86400 : 12 * 3600
+        var res = redirect(next)
+        res.setCookie(Cookie(name: AuthState.cookieName, value: auth.startSession(lifetime: lifetime),
+                             maxAge: remember ? Int(lifetime) : nil, path: "/", httpOnly: true, sameSite: .lax))
+        return res
+    }
+    router.post("/logout") { request, _ in
+        if let t = request.cookies[AuthState.cookieName]?.value { auth.endSession(t) }
+        var res = redirect("/login")
+        res.setCookie(Cookie(name: AuthState.cookieName, value: "", maxAge: 0, path: "/", httpOnly: true, sameSite: .lax))
+        return res
+    }
 
     // ---- Sources
     router.get("/") { _, _ in
@@ -81,8 +133,10 @@ public func makeRouter(store: Store, engine: Engine, password: String?) -> Route
         s.jellyfinLibraryID = f.str("jellyfinLibrary").isEmpty ? nil : f.str("jellyfinLibrary")
         s.absLibraryID = f.str("absLibrary").isEmpty ? nil : f.str("absLibrary")
         s.intervalMinutes = max(15, f.int("interval", default: 360))
-        s.backfillMode = BackfillMode(rawValue: f.str("backfill")) ?? .fromNow
+        s.backfillMode = BackfillMode(rawValue: f.str("backfill")) ?? .nothing
         s.backfillCount = max(0, f.int("count", default: 10))
+        s.maxPerCheck = f.int("maxPerCheck", default: 0) > 0 ? f.int("maxPerCheck", default: 0) : nil
+        s.saveChannelCover = f.bool("channelCover")
         s.skipShorts = f.bool("skipShorts"); s.skipLive = f.bool("skipLive")
         s.titleRegex = f.str("titleRegex"); s.extraArgs = f.str("extraArgs")
         s.enabled = f.bool("enabled")
@@ -122,6 +176,11 @@ public func makeRouter(store: Store, engine: Engine, password: String?) -> Route
         return html(H.page(s.name, active: "sources", status: status, refresh: busy,
                            Pages.browse(s, videos: await store.catalog(id, .videos), playlists: await store.catalog(id, .playlists),
                                         busy: busy, progress: status.progress)))
+    }
+    router.post("/sources/:id/cover") { _, ctx in
+        guard let id = uuid(ctx) else { return notFound() }
+        await engine.refreshCover(id)
+        return redirect("/sources/\(id)/browse")
     }
     router.post("/sources/:id/scan") { _, ctx in
         guard let id = uuid(ctx) else { return notFound() }
@@ -176,6 +235,8 @@ public func makeRouter(store: Store, engine: Engine, password: String?) -> Route
         p.embedMetadata = f.bool("embedMetadata"); p.embedThumbnail = f.bool("embedThumbnail")
         p.writeInfoJSON = f.bool("writeInfoJSON"); p.embedSubs = f.bool("embedSubs")
         p.writeThumbnail = f.bool("writeThumbnail"); p.nfoStyle = NFOStyle(rawValue: f.str("nfoStyle")) ?? NFOStyle.off
+        p.albumTag = f.str("albumTag").isEmpty ? nil : f.str("albumTag")
+        p.artistTag = f.str("artistTag").isEmpty ? nil : f.str("artistTag")
         p.sponsorblockRemove = f.str("sponsorblock"); p.extraArgs = f.str("extraArgs")
         if p.name.isEmpty { p.name = "Untitled profile" }
         if p.format.isEmpty { p.format = "bv*+ba/b" }
@@ -263,7 +324,8 @@ public func makeRouter(store: Store, engine: Engine, password: String?) -> Route
 
 /// Runs the web UI until the surrounding task is cancelled.
 public func runWebServer(store: Store, engine: Engine, config: WebConfig) async throws {
-    let router = makeRouter(store: store, engine: engine, password: config.password)
+    let router = makeRouter(store: store, engine: engine, password: config.password, username: config.username,
+                            loopbackOnly: ["127.0.0.1", "localhost", "::1"].contains(config.bind))
     let app = Application(router: router,
                           configuration: .init(address: .hostname(config.bind, port: config.port), serverName: "YTArr"))
     try await app.runService()

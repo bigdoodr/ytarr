@@ -26,8 +26,14 @@ enum H {
     pre{background:var(--card);padding:12px;border-radius:8px;overflow:auto;font-size:12.5px;max-height:420px}
     .pill{display:inline-block;padding:1px 8px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-size:12px}
     small{color:var(--mut)}
+    .signout{display:inline;margin:0}.signout button{padding:2px 10px;font-size:13px}
+    .login{max-width:340px;margin:12vh auto;padding:0 20px}.login h1{text-align:center;margin-bottom:18px}
+    .login form{display:grid;gap:12px}.login input[type=text],.login input[type=password]{padding:10px}
     .pg{margin:8px 0;color:var(--mut);font-size:13px}.pg b{color:var(--fg)}.pg a{margin:0 2px}
     """
+
+    /// Set when a password is configured, so every page offers Sign out.
+    nonisolated(unsafe) static var showSignOut = false
 
     static func page(_ title: String, active: String, status: Engine.Status, refresh: Bool = false, _ body: String) -> String {
         func nav(_ id: String, _ label: String, _ href: String) -> String {
@@ -35,6 +41,7 @@ enum H {
         }
         let state: String
         if status.updating { state = "Updating yt-dlp..." }
+        else if let p = status.pausedUntil { state = "Paused until \(date(p)) (YouTube rate limit)" }
         else if let r = status.running { state = "Running: \(esc(r))" }
         else { state = "Idle" }
         let ver = status.ytdlpVersion.map { "yt-dlp \(esc($0))" } ?? "yt-dlp not installed"
@@ -43,7 +50,23 @@ enum H {
         \(refresh ? "<meta http-equiv=\"refresh\" content=\"5\">" : "")
         <title>\(esc(title)) - YTArr</title><style>\(css)</style></head><body>
         <header><b>YTArr</b>\(nav("sources", "Sources", "/"))\(nav("profiles", "Profiles", "/profiles"))\(nav("activity", "Activity", "/activity"))\(nav("settings", "Settings", "/settings"))
-        <span class="r">\(state) &middot; \(ver)</span></header><main>\(body)</main></body></html>
+        <span class="r">\(state) &middot; \(ver)\(showSignOut ? " &middot; <form class=\"signout\" method=\"post\" action=\"/logout\"><button>Sign out</button></form>" : "")</span></header><main>\(body)</main></body></html>
+        """
+    }
+
+    static func loginPage(error: String?, next: String) -> String {
+        """
+        <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Sign in - YTArr</title><style>\(css)</style></head><body>
+        <div class="login"><h1>YTArr</h1>
+        \(error.map { "<p class=\"bad\">\(esc($0))</p>" } ?? "")
+        <form method="post" action="/login">
+        <input type="hidden" name="next" value="\(esc(next))">
+        <input type="text" name="username" placeholder="Username" autocomplete="username" autocapitalize="none" autocorrect="off" autofocus required>
+        <input type="password" name="password" placeholder="Password" autocomplete="current-password" required>
+        <label class="row"><input type="checkbox" name="remember" checked> Remember me</label>
+        <button class="p">Sign in</button>
+        </form></div></body></html>
         """
     }
 
@@ -80,6 +103,8 @@ struct Form {
     }
     /// Every value submitted under this name (e.g. a list of checked boxes).
     func all(_ k: String) -> [String] { multi[k] ?? [] }
+    /// The value exactly as submitted (passwords must not be trimmed).
+    func raw(_ k: String) -> String { values[k] ?? "" }
     func str(_ k: String) -> String { (values[k] ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
     func bool(_ k: String) -> Bool { values[k] != nil }
     func int(_ k: String, default d: Int) -> Int { Int(str(k)) ?? d }

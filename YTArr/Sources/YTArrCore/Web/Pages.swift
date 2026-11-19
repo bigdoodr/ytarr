@@ -77,7 +77,8 @@ enum Pages {
         <div class="row"><h1 style="margin:0">\(H.esc(src.name))</h1><span style="flex:1"></span>
         <a class="btn" href="/sources/\(id)">Settings</a>
         <form method="post" action="/sources/\(id)/scan"><button>Scan videos</button></form>
-        \(isChannel ? "<form method=\"post\" action=\"/sources/\(id)/scan-playlists\"><button>Scan playlists</button></form>" : "")</div>
+        \(isChannel ? "<form method=\"post\" action=\"/sources/\(id)/scan-playlists\"><button>Scan playlists</button></form>" : "")
+        \(isChannel ? "<form method=\"post\" action=\"/sources/\(id)/cover\"><button>Refresh channel cover</button></form>" : "")</div>
         <p class="mut">Browse what's available and choose what to download. Scanning only lists titles; it never downloads.</p>
         \(busyNote)\(plSection)\(vidSection)
         <script>\(pagerScript)\(script)</script>
@@ -183,6 +184,8 @@ enum Pages {
         \(H.select("Check every", "interval", ivOpts, selected: String(src.intervalMinutes)))
         \(H.select("First check", "backfill", [("nothing", "Index only - download nothing, I'll pick videos"), ("fromNow", "Only new videos from now on"), ("latest", "Newest N videos, then new ones"), ("all", "Everything")], selected: src.backfillMode.rawValue))
         \(H.input("N (for 'Newest N')", "count", String(src.backfillCount), type: "number"))
+        \(H.input("Max downloads per check", "maxPerCheck", src.maxPerCheck.map(String.init) ?? "", hint: "Blank = no limit. A cap keeps a big backlog from hammering YouTube: the rest follows on later checks (each check then looks through the whole channel, not only the newest videos).", type: "number"))
+        \(H.check("Save channel picture as cover.jpg", "channelCover", src.saveChannelCover ?? false))
         \(H.check("Skip Shorts", "skipShorts", src.skipShorts))
         \(H.check("Skip live streams", "skipLive", src.skipLive))
         \(H.input("Title must match", "titleRegex", src.titleRegex, hint: "Optional regex, case-insensitive"))
@@ -222,6 +225,8 @@ enum Pages {
         \(H.input("Audio quality", "audioQuality", pr.audioQuality, hint: "0 = best ... 10 = worst, or a bitrate like 192K"))
         \(H.input("File name template", "outputTemplate", pr.outputTemplate, hint: "yt-dlp output template, relative to the folder"))
         \(H.check("Embed metadata", "embedMetadata", pr.embedMetadata))
+        \(H.input("Album tag", "albumTag", pr.albumTag ?? "", hint: "yt-dlp template such as %(channel,uploader)s (no colons). Needs Embed metadata. Blank = leave as is."))
+        \(H.input("Artist tag", "artistTag", pr.artistTag ?? "", hint: "Same idea for the Artist tag."))
         \(H.check("Embed thumbnail", "embedThumbnail", pr.embedThumbnail))
         \(H.check("Write .info.json", "writeInfoJSON", pr.writeInfoJSON))
         \(H.check("Save thumbnail file (.jpg)", "writeThumbnail", pr.writeThumbnail ?? false))
@@ -260,6 +265,7 @@ enum Pages {
         let ff = status.ffmpegDir.map { "found in \(H.esc($0))" } ?? "<span class=bad>not found - run <code>brew install ffmpeg</code> (needed to merge video/audio and convert audio)</span>"
         return """
         <h1>Settings</h1>
+        <p class="mut">The web sign-in (username and password), port and network access are in the YTArr menu bar icon, under Settings...</p>
         <h2>yt-dlp</h2>
         <p>Version: <b>\(H.esc(status.ytdlpVersion ?? "not installed"))</b> <small>\(H.esc(status.ytdlpPath ?? ""))</small><br>
         ffmpeg: \(ff)<br>

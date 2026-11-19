@@ -10,16 +10,27 @@ public actor Engine {
         public var ytdlpVersion: String?
         public var ytdlpPath: String?
         public var ffmpegDir: String?
+        public var pausedUntil: Date?      // set while waiting out a YouTube rate limit
+    }
+
+    /// Something worth telling the person about (new downloads, or a source that started failing).
+    public struct Notice: Sendable {
+        public enum Kind: Sendable { case downloaded, problem }
+        public var kind: Kind
+        public var title: String
+        public var body: String
     }
 
     public let store: Store
     public let ytdlp: YtDlpManager
+    private var notifier: (@Sendable (Notice) -> Void)?
 
     /// One-off work requested from the Browse page; runs ahead of scheduled checks, one at a time.
     private enum Job: Equatable {
         case scanVideos(UUID)
         case scanPlaylists(UUID)
         case download(UUID, [String])
+        case refreshCover(UUID)
     }
 
     private var queue: [UUID] = []
@@ -30,6 +41,9 @@ public actor Engine {
     private var updating = false
     private var draining = false
     private var cancelled = false
+    // YouTube throttling: when yt-dlp reports it we stop the run and wait, instead of failing through every video.
+    private var throttled: (reason: String, minutes: Int)?
+    private var pausedUntil: Date?
     private var log: [String] = []
     private var loopTask: Task<Void, Never>?
     private let box = ProcessBox()
@@ -54,6 +68,9 @@ public actor Engine {
         }
     }
 
+    /// The host app sets this to show system notifications. Engine-only use (ytarrd) can leave it unset.
+    public func setNotifier(_ f: (@Sendable (Notice) -> Void)?) { notifier = f }
+
     public func stop() { loopTask?.cancel(); loopTask = nil; box.terminate() }
 
     // MARK: Public commands
@@ -72,6 +89,8 @@ public actor Engine {
     public func scanVideos(_ id: UUID) { enqueue(.scanVideos(id)) }
     /// Lists a channel's playlists (no downloading).
     public func scanPlaylists(_ id: UUID) { enqueue(.scanPlaylists(id)) }
+    /// Re-fetches the channel picture as cover.jpg (replacing the current one) in the folders this source's videos are in.
+    public func refreshCover(_ id: UUID) { enqueue(.refreshCover(id)) }
     /// Downloads the chosen catalog videos now, using the source's profile.
     public func download(_ id: UUID, videoIDs: [String]) { if !videoIDs.isEmpty { enqueue(.download(id, videoIDs)) } }
 
@@ -94,7 +113,8 @@ public actor Engine {
         }
         let names = queue.compactMap { id in st.sources.first { $0.id == id }?.name }
         return Status(running: currentName, progress: progress, queued: names, updating: updating,
-                      ytdlpVersion: cachedVersion, ytdlpPath: cachedPath, ffmpegDir: ytdlp.ffmpegDirectory())
+                      ytdlpVersion: cachedVersion, ytdlpPath: cachedPath, ffmpegDir: ytdlp.ffmpegDirectory(),
+                      pausedUntil: pausedUntil.flatMap { $0 > Date() ? $0 : nil })
     }
 
     public func recentLog() -> [String] { Array(log.suffix(200).reversed()) }
@@ -105,6 +125,7 @@ public actor Engine {
         await maybeUpdate(force: false)
         let st = await store.snapshot()
         let now = Date()
+        if let p = pausedUntil, p > now { return }   // wait out the YouTube limit
         for s in st.sources where s.enabled && s.nextCheck <= now && !queue.contains(s.id) && currentID != s.id {
             queue.append(s.id)
         }
@@ -116,6 +137,11 @@ public actor Engine {
         draining = true
         defer { draining = false }
         while !jobs.isEmpty || !queue.isEmpty {
+            if let until = pausedUntil, until > Date() {
+                appendLog("Paused until \(Self.clock(until)) because YouTube is limiting requests; dropped \(queue.count + jobs.count) queued item(s). Scheduled checks resume on their own.")
+                queue.removeAll(); jobs.removeAll()
+                break
+            }
             if !jobs.isEmpty { await runJob(jobs.removeFirst()) }
             else { await runCheck(queue.removeFirst()) }
         }
@@ -138,6 +164,14 @@ public actor Engine {
         appendLog("yt-dlp: \(result)")
     }
 
+    /// For paths under /Volumes, returns the volume root if it isn't mounted (so we never write to the boot disk by accident).
+    static func missingVolume(_ path: String) -> String? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count >= 2, parts[0] == "Volumes" else { return nil }
+        let root = "/Volumes/" + parts[1]
+        return FileManager.default.fileExists(atPath: root) ? nil : root
+    }
+
     // MARK: Running a check
 
     private func appendLog(_ s: String) {
@@ -150,15 +184,46 @@ public actor Engine {
 
     private func setProgress(_ s: String) { progress = s }
 
-    private func finish(_ id: UUID, _ status: String, markInitial: Bool = false) async {
+    // MARK: YouTube throttling
+
+    /// yt-dlp output meaning YouTube is limiting us, with how long to back off (it says rate limits last up to an hour).
+    static func throttleReason(_ line: String) -> (reason: String, minutes: Int)? {
+        let l = line.lowercased()
+        if l.contains("rate-limited by youtube") { return ("YouTube is rate-limiting this connection", 60) }
+        if l.contains("not a bot") || l.contains("sign in to confirm") { return ("YouTube asked to confirm you're not a bot (try browser cookies in Settings)", 30) }
+        return nil
+    }
+
+    private static let clockFormat: DateFormatter = { let f = DateFormatter(); f.dateFormat = "h:mm a"; return f }()
+    static func clock(_ d: Date) -> String { clockFormat.string(from: d) }
+
+    /// Stops all work until the back-off ends. Anything that didn't finish is not marked as downloaded.
+    private func startPause(_ t: (reason: String, minutes: Int)) {
+        if let p = pausedUntil, p > Date() { return }
+        let until = Date().addingTimeInterval(Double(t.minutes) * 60)
+        pausedUntil = until
+        appendLog("Stopped: \(t.reason). Pausing all downloads until \(Self.clock(until)); videos that hadn't finished are not marked as downloaded.")
+        notifier?(Notice(kind: .problem, title: "YTArr paused", body: "\(t.reason). Resuming around \(Self.clock(until))."))
+    }
+
+    private func finish(_ id: UUID, _ status: String, markInitial: Bool = false, keepSchedule: Bool = false) async {
         appendLog("[\(currentName ?? "?")] \(status)")
-        await store.mutateSource(id) { $0.lastChecked = Date(); $0.lastStatus = status; if markInitial { $0.initialSyncDone = true } }
+        let previous = await store.source(id)?.lastStatus
+        let name = currentName ?? "YTArr"
+        if status.hasPrefix("Error") || status.hasPrefix("Blocked") {
+            // Only on a change, so a source that keeps failing doesn't notify on every check.
+            if previous != status { notifier?(Notice(kind: .problem, title: "YTArr: \(name)", body: String(status.prefix(160)))) }
+        } else if status.hasPrefix("OK - "), !status.hasPrefix("OK - nothing new") {
+            let n = status.dropFirst(5).split(separator: " ").first.flatMap { Int($0) } ?? 0
+            notifier?(Notice(kind: .downloaded, title: "YTArr: \(name)", body: n == 1 ? "1 new video downloaded" : "\(max(n, 1)) new videos downloaded"))
+        }
+        await store.mutateSource(id) { if !keepSchedule { $0.lastChecked = Date() }; $0.lastStatus = status; if markInitial { $0.initialSyncDone = true } }
     }
 
     private func runCheck(_ id: UUID) async {
         guard let src = await store.source(id) else { return }
         let st = await store.snapshot()
-        currentID = id; currentName = src.name; progress = "Starting..."; cancelled = false
+        currentID = id; currentName = src.name; progress = "Starting..."; cancelled = false; throttled = nil
         defer { currentID = nil; currentName = nil; progress = "" }
 
         guard let profile = st.profiles.first(where: { $0.id == src.profileID }) else {
@@ -176,6 +241,9 @@ public actor Engine {
         let root = AppPaths.expand(st.settings.libraryRoot)
         let dest = URL(fileURLWithPath: src.destination.isEmpty
                        ? root + "/" + AppPaths.sanitize(profile.name) : AppPaths.expand(src.destination))
+        if let vol = Self.missingVolume(dest.path) {
+            await finish(id, "Error: \(vol) is not mounted - skipped (nothing was written)"); return
+        }
         try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
         let archive = store.archiveURL(for: id)
 
@@ -250,14 +318,20 @@ public actor Engine {
         }
 
         await store.markDownloaded(id, ids: doneIDs)
+        writeSidecars(paths: donePaths, profile: profile)
+        if !doneIDs.isEmpty { await notifyServers(src, st.settings) }
+        if src.saveChannelCover == true, throttled == nil, !donePaths.isEmpty {
+            await saveCovers(src, dirs: Self.parentFolders(of: donePaths), exe: exe, ffmpegDir: ffmpegDir, settings: st.settings, force: false)
+        }
         let result: String
-        if cancelled { result = "Cancelled" }
-        else if done > 0 { result = "OK - \(done) new" + (errors.isEmpty ? "" : " (\(errors.count) errors)") }
+        if let t = throttled { startPause(t); result = "Paused - \(t.reason); retrying after \(Self.clock(pausedUntil ?? Date()))" }
+        else if cancelled { result = "Cancelled" }
+        else if done > 0 { result = "OK - \(done) new" + (status == 101 ? " - limit reached, more on the next check" : "") + (errors.isEmpty ? "" : " (\(errors.count) errors)") }
         else if status == 0 || errors.isEmpty { result = "OK - nothing new" }
         else if errors.contains(where: { $0.localizedCaseInsensitiveContains("not a bot") || $0.localizedCaseInsensitiveContains("sign in") }) {
             result = "Blocked by YouTube - set browser cookies in Settings"
         } else { result = "Error: " + String(errors.last!.prefix(200)) }
-        await finish(id, result)
+        await finish(id, result, keepSchedule: throttled != nil)
     }
 
     // MARK: After downloads
@@ -282,6 +356,30 @@ public actor Engine {
                 do { try await MediaServers.scanAudiobookshelf(settings, libraryID: lib); appendLog("\(tag) Asked Audiobookshelf to scan its library") }
                 catch { appendLog("\(tag) Audiobookshelf scan failed: \(error.localizedDescription)") }
             } else { appendLog("\(tag) An Audiobookshelf library is set, but Audiobookshelf isn't configured in Settings") }
+        }
+    }
+
+    // MARK: Channel cover
+
+    static func parentFolders(of paths: [String]) -> [URL] {
+        var out: [URL] = []
+        for p in paths { let d = URL(fileURLWithPath: p).deletingLastPathComponent(); if !out.contains(d) { out.append(d) } }
+        return out
+    }
+
+    /// Saves the channel picture as cover.jpg in each folder. Without `force`, folders that already have one are left alone.
+    private func saveCovers(_ src: Source, dirs: [URL], exe: URL, ffmpegDir: String?, settings: Settings, force: Bool) async {
+        let tag = "[\(src.name)]"
+        let todo = dirs.filter { force || !FileManager.default.fileExists(atPath: $0.appendingPathComponent("cover.jpg").path) }
+        guard !todo.isEmpty else { return }
+        guard src.kind == .channel else { appendLog("\(tag) The channel cover needs a channel source (a youtube.com/@name URL)"); return }
+        progress = "Fetching channel cover..."
+        guard let url = await ChannelCover.avatarURL(exe: exe, channelURL: ArgBuilder.channelBase(src), settings: settings, ffmpegDir: ffmpegDir) else {
+            appendLog("\(tag) Couldn't find the channel's picture"); return
+        }
+        for d in todo {
+            if await ChannelCover.save(avatarURL: url, to: d, ffmpegDir: ffmpegDir) { appendLog("\(tag) Saved channel cover: \(d.lastPathComponent)/cover.jpg") }
+            else { appendLog("\(tag) Couldn't save the channel cover in \(d.path)") }
         }
     }
 
@@ -330,11 +428,11 @@ public actor Engine {
     private func runJob(_ job: Job) async {
         let sid: UUID
         switch job {
-        case .scanVideos(let i), .scanPlaylists(let i), .download(let i, _): sid = i
+        case .scanVideos(let i), .scanPlaylists(let i), .download(let i, _), .refreshCover(let i): sid = i
         }
         guard let src = await store.source(sid) else { return }
         let st = await store.snapshot()
-        currentID = sid; currentName = src.name; progress = "Starting..."; cancelled = false
+        currentID = sid; currentName = src.name; progress = "Starting..."; cancelled = false; throttled = nil
         defer { currentID = nil; currentName = nil; progress = "" }
         let tag = "[\(src.name)]"
 
@@ -359,6 +457,19 @@ public actor Engine {
             await store.saveCatalog(sid, playlists ? .playlists : .videos, r.entries)
             appendLog("\(tag) Found \(r.entries.count) \(noun)")
 
+        case .refreshCover:
+            // Where this source's videos actually are (newest downloads first), else its download folder.
+            var dirs: [URL] = []
+            for r in st.history.filter({ $0.sourceName == src.name }).prefix(50) {
+                let d = URL(fileURLWithPath: r.path).deletingLastPathComponent()
+                if FileManager.default.fileExists(atPath: d.path), !dirs.contains(d) { dirs.append(d) }
+            }
+            if dirs.isEmpty, let profile = st.profiles.first(where: { $0.id == src.profileID }) {
+                let root = AppPaths.expand(st.settings.libraryRoot)
+                dirs = [URL(fileURLWithPath: src.destination.isEmpty ? root + "/" + AppPaths.sanitize(profile.name) : AppPaths.expand(src.destination))]
+            }
+            await saveCovers(src, dirs: dirs, exe: exe, ffmpegDir: ffmpegDir, settings: st.settings, force: true)
+
         case .download(_, let ids):
             let wanted = Set(ids)
             let picked = await store.catalog(sid, .videos).filter { wanted.contains($0.id) }
@@ -368,6 +479,7 @@ public actor Engine {
             let root = AppPaths.expand(st.settings.libraryRoot)
             let dest = URL(fileURLWithPath: src.destination.isEmpty
                            ? root + "/" + AppPaths.sanitize(profile.name) : AppPaths.expand(src.destination))
+            if let vol = Self.missingVolume(dest.path) { appendLog("\(tag) Error: \(vol) is not mounted - nothing downloaded"); return }
             try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
             progress = "Downloading \(picked.count) selected video(s)..."
             appendLog("\(tag) Downloading \(picked.count) selected video(s)...")
@@ -392,12 +504,21 @@ public actor Engine {
             await store.markDownloaded(sid, ids: doneIDs)
             writeSidecars(paths: donePaths, profile: profile)
             if !doneIDs.isEmpty { await notifyServers(src, st.settings) }
-            appendLog("\(tag) \(cancelled ? "Cancelled" : "Finished"): \(doneIDs.count) of \(picked.count) downloaded")
+            if src.saveChannelCover == true, throttled == nil, !donePaths.isEmpty {
+                await saveCovers(src, dirs: Self.parentFolders(of: donePaths), exe: exe, ffmpegDir: ffmpegDir, settings: st.settings, force: false)
+            }
+            if let t = throttled { startPause(t) }
+            appendLog("\(tag) \(cancelled ? "Cancelled" : throttled != nil ? "Stopped (YouTube throttling)" : "Finished"): \(doneIDs.count) of \(picked.count) downloaded")
+            if !doneIDs.isEmpty {
+                notifier?(Notice(kind: .downloaded, title: "YTArr: \(src.name)", body: doneIDs.count == 1 ? "1 video downloaded" : "\(doneIDs.count) videos downloaded"))
+            }
         }
     }
 
     /// Live progress line from yt-dlp's progress template.
     private func ingestLive(_ line: String) {
+        // Stop at the first sign of throttling; carrying on only makes YouTube's block last longer.
+        if throttled == nil, let t = Self.throttleReason(line) { throttled = t; box.terminate() }
         // Stream yt-dlp's own output into the log as it happens (progress/done markers are handled separately).
         if !line.isEmpty && !line.hasPrefix("YTARR_PROG") && !line.hasPrefix("YTARR_DONE") { appendLog("  \(line)") }
         if line.hasPrefix("YTARR_PROG\t") {

@@ -50,19 +50,23 @@ public struct Profile: Codable, Identifiable, Hashable, Sendable {
     // Optional so state.json files saved before these existed still load (nil = off).
     public var writeThumbnail: Bool?      // save the thumbnail as a .jpg next to the video (Jellyfin artwork)
     public var nfoStyle: NFOStyle?        // write a Jellyfin .nfo (title, description, date, channel)
+    public var albumTag: String?          // yt-dlp template for the Album tag, e.g. %(channel,uploader)s (needs Embed metadata)
+    public var artistTag: String?         // same for the Artist tag
 
     public init(id: UUID = UUID(), name: String, kind: ProfileKind, format: String,
                 mergeFormat: String = "", audioFormat: String = "", audioQuality: String = "0",
                 outputTemplate: String, embedMetadata: Bool = true, embedThumbnail: Bool = false,
                 writeInfoJSON: Bool = false, embedSubs: Bool = false,
                 sponsorblockRemove: String = "", extraArgs: String = "",
-                writeThumbnail: Bool? = nil, nfoStyle: NFOStyle? = nil) {
+                writeThumbnail: Bool? = nil, nfoStyle: NFOStyle? = nil,
+                albumTag: String? = nil, artistTag: String? = nil) {
         self.id = id; self.name = name; self.kind = kind; self.format = format
         self.mergeFormat = mergeFormat; self.audioFormat = audioFormat; self.audioQuality = audioQuality
         self.outputTemplate = outputTemplate; self.embedMetadata = embedMetadata
         self.embedThumbnail = embedThumbnail; self.writeInfoJSON = writeInfoJSON
         self.embedSubs = embedSubs; self.sponsorblockRemove = sponsorblockRemove; self.extraArgs = extraArgs
         self.writeThumbnail = writeThumbnail; self.nfoStyle = nfoStyle
+        self.albumTag = albumTag; self.artistTag = artistTag
     }
 
     public static let builtins: [Profile] = [
@@ -79,11 +83,11 @@ public struct Profile: Codable, Identifiable, Hashable, Sendable {
         Profile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!,
                 name: "Audio - MP3", kind: .audio, format: "bestaudio/best", audioFormat: "mp3",
                 outputTemplate: "%(channel,uploader)s/%(title)s [%(id)s].%(ext)s",
-                embedThumbnail: true),
+                embedThumbnail: true, albumTag: "%(channel,uploader)s", artistTag: "%(channel,uploader)s"),
         Profile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!,
                 name: "Podcast - M4A", kind: .audio, format: "bestaudio[ext=m4a]/bestaudio/best", audioFormat: "m4a",
                 outputTemplate: "%(channel,uploader)s/%(upload_date)s - %(title)s.%(ext)s",
-                embedThumbnail: true),
+                embedThumbnail: true, albumTag: "%(channel,uploader)s", artistTag: "%(channel,uploader)s"),
     ]
 }
 
@@ -97,7 +101,7 @@ public struct Source: Codable, Identifiable, Hashable, Sendable {
     public var destination: String = ""      // "" = <libraryRoot>/<profile name>
     public var enabled = true
     public var intervalMinutes = 360
-    public var backfillMode: BackfillMode = .fromNow
+    public var backfillMode: BackfillMode = .nothing
     public var backfillCount = 10
     public var skipShorts = true
     public var skipLive = true
@@ -109,6 +113,8 @@ public struct Source: Codable, Identifiable, Hashable, Sendable {
     // Library to rescan after new downloads (ids come from the media server's own library list).
     public var jellyfinLibraryID: String?
     public var absLibraryID: String?
+    public var maxPerCheck: Int?          // nil or 0 = no limit; a cap lets a big backlog trickle in over several checks
+    public var saveChannelCover: Bool?    // save the channel picture as cover.jpg in the folder the videos land in
 
     public var nextCheck: Date {
         (lastChecked ?? .distantPast).addingTimeInterval(Double(intervalMinutes) * 60)

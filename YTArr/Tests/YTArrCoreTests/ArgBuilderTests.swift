@@ -54,3 +54,12 @@ final class ArgBuilderTests: XCTestCase {
         XCTAssertFalse(f.bool("skipLive"))
     }
 }
+
+final class SafeTokensTests: XCTestCase {
+    func testBlocksExecAndConfig() {
+        XCTAssertEqual(ArgBuilder.safeTokens("--exec 'rm -rf x' --no-mtime"), ["--no-mtime"])
+        XCTAssertEqual(ArgBuilder.safeTokens("--exec=foo --limit-rate 1M"), ["--limit-rate", "1M"])
+        XCTAssertEqual(ArgBuilder.safeTokens("--exe foo --config-locations /tmp/x -f best"), ["-f", "best"])
+        XCTAssertEqual(ArgBuilder.safeTokens("--extract-audio --embed-chapters"), ["--extract-audio", "--embed-chapters"])
+    }
+}
