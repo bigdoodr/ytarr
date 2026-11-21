@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-latest
+    runs-on: xcode-27
     env:
       TEAM_ID: C7ZFPH2CB5
     steps:
