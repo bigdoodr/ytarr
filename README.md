@@ -15,3 +15,6 @@ Add channels and playlists in the browser, pick a media profile for each (best M
 Distributed outside the App Store (Developer ID + notarization): a yt-dlp front end isn't App Store material, and the app runs unsandboxed.
 
 Use it only for content you have the right to download.
+
+## License
+MIT. See [LICENSE](LICENSE). yt-dlp and ffmpeg are separate projects with their own licenses; YTArr downloads and runs them but does not bundle them.
