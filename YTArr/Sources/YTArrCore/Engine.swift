@@ -15,7 +15,7 @@ public actor Engine {
 
     /// Something worth telling the person about (new downloads, or a source that started failing).
     public struct Notice: Sendable {
-        public enum Kind: Sendable { case downloaded, problem }
+        public enum Kind: Sendable { case downloaded, problem, newVideos }
         public var kind: Kind
         public var title: String
         public var body: String
@@ -238,6 +238,12 @@ public actor Engine {
         guard let exe = exeOpt else { await finish(id, "Error: yt-dlp is not installed (see Settings)"); return }
         let ffmpegDir = ytdlp.ffmpegDirectory()
 
+        // Monitor only: list new uploads into the catalog and notify; never download.
+        if src.monitorOnly == true {
+            await runMonitor(src, exe: exe, settings: st.settings, ffmpegDir: ffmpegDir)
+            return
+        }
+
         let root = AppPaths.expand(st.settings.libraryRoot)
         let dest = URL(fileURLWithPath: src.destination.isEmpty
                        ? root + "/" + AppPaths.sanitize(profile.name) : AppPaths.expand(src.destination))
@@ -332,6 +338,43 @@ public actor Engine {
             result = "Blocked by YouTube - set browser cookies in Settings"
         } else { result = "Error: " + String(errors.last!.prefix(200)) }
         await finish(id, result, keepSchedule: throttled != nil)
+    }
+
+    // MARK: Monitor only
+
+    /// Looks for uploads we haven't seen and lists them on the Browse page flagged "new". Downloads nothing.
+    private func runMonitor(_ src: Source, exe: URL, settings: Settings, ffmpegDir: String?) async {
+        let id = src.id
+        let baseline = await store.catalog(id, .videos).isEmpty
+        progress = baseline ? "Indexing videos (nothing will be downloaded)..." : "Looking for new videos..."
+        appendLog("[\(src.name)] \(progress)")
+        // After the first listing, a channel's newest uploads are enough (it lists newest first).
+        let newest: Int? = (!baseline && src.kind == .channel) ? 100 : nil
+        let r = await listEntries(exe, ArgBuilder.catalogArgs(source: src, settings: settings, ffmpegDir: ffmpegDir,
+                                                              playlists: false, newest: newest), noun: "videos")
+        if cancelled { await finish(id, "Cancelled"); return }
+        if let e = r.error { await finish(id, "Error: could not list videos: \(e)"); return }
+
+        if baseline {
+            await store.saveCatalog(id, .videos, r.entries)
+            if !src.initialSyncDone {
+                // Mark everything as had, so switching Monitor only off later doesn't download the whole backlog.
+                let archive = store.archiveURL(for: id)
+                let lines = r.entries.map { $0.key.lowercased() + " " + $0.id + "\n" }.joined()
+                let existing = (try? String(contentsOf: archive, encoding: .utf8)) ?? ""
+                try? (existing + lines).write(to: archive, atomically: true, encoding: .utf8)
+            }
+            await finish(id, "Monitoring - indexed \(r.entries.count) videos", markInitial: true)
+            return
+        }
+
+        let fresh = await store.mergeNew(id, r.entries)
+        guard !fresh.isEmpty else { await finish(id, "Monitor - nothing new"); return }
+        let n = fresh.count
+        let titles = fresh.prefix(3).map(\.title).joined(separator: "; ")
+        notifier?(Notice(kind: .newVideos, title: "YTArr: \(src.name)",
+                         body: (n == 1 ? "1 new video: " : "\(n) new videos: ") + String(titles.prefix(140))))
+        await finish(id, "Monitor - \(n) new video\(n == 1 ? "" : "s") (not downloaded)")
     }
 
     // MARK: After downloads

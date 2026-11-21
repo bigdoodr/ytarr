@@ -136,6 +136,7 @@ public func makeRouter(store: Store, engine: Engine, password: String?, username
         s.backfillMode = BackfillMode(rawValue: f.str("backfill")) ?? .nothing
         s.backfillCount = max(0, f.int("count", default: 10))
         s.maxPerCheck = f.int("maxPerCheck", default: 0) > 0 ? f.int("maxPerCheck", default: 0) : nil
+        s.monitorOnly = f.bool("monitorOnly")
         s.saveChannelCover = f.bool("channelCover")
         s.skipShorts = f.bool("skipShorts"); s.skipLive = f.bool("skipLive")
         s.titleRegex = f.str("titleRegex"); s.extraArgs = f.str("extraArgs")
@@ -151,7 +152,7 @@ public func makeRouter(store: Store, engine: Engine, password: String?, username
         await store.upsert(s)
         await engine.checkNow(s.id)          // first check right away
         // "Index only" sources go straight to the picker; it fills in once the scan finishes.
-        return redirect(s.backfillMode == .nothing ? "/sources/\(s.id)/browse" : "/")
+        return redirect(s.backfillMode == .nothing || s.monitorOnly == true ? "/sources/\(s.id)/browse" : "/")
     }
     router.post("/sources/:id") { request, ctx in
         guard let id = uuid(ctx), var s = await store.source(id) else { return notFound() }
@@ -169,6 +170,11 @@ public func makeRouter(store: Store, engine: Engine, password: String?, username
     }
 
     // ---- Browse: pick videos / playlists without downloading everything
+    router.post("/sources/:id/seen") { _, ctx in
+        guard let id = uuid(ctx) else { return notFound() }
+        await store.clearNew(id)
+        return redirect("/sources/\(id)/browse")
+    }
     router.get("/sources/:id/browse") { _, ctx in
         guard let id = uuid(ctx), let s = await store.source(id) else { return notFound() }
         let status = await engine.status()

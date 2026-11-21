@@ -29,6 +29,7 @@ public struct CatalogEntry: Codable, Identifiable, Hashable, Sendable {
     public var duration: String
     public var url: String
     public var downloaded = false
+    public var isNew: Bool?        // found by a Monitor-only check and not looked at yet
 }
 
 /// A media profile: how yt-dlp should fetch and name things (like a Sonarr quality profile).
@@ -114,6 +115,7 @@ public struct Source: Codable, Identifiable, Hashable, Sendable {
     public var jellyfinLibraryID: String?
     public var absLibraryID: String?
     public var maxPerCheck: Int?          // nil or 0 = no limit; a cap lets a big backlog trickle in over several checks
+    public var monitorOnly: Bool?         // check for new uploads and tell me, but never download automatically (pick videos on Browse)
     public var saveChannelCover: Bool?    // save the channel picture as cover.jpg in the folder the videos land in
 
     public var nextCheck: Date {

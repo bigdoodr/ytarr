@@ -134,10 +134,11 @@ public enum ArgBuilder {
 
     /// Lists every entry of the source (or of the channel's Playlists tab) without downloading anything.
     /// Output lines: `YTARR_ENT <TAB> extractor <TAB> id <TAB> title <TAB> duration <TAB> url`.
-    public static func catalogArgs(source: Source, settings s: Settings, ffmpegDir: String?, playlists: Bool) -> [String] {
+    public static func catalogArgs(source: Source, settings s: Settings, ffmpegDir: String?, playlists: Bool, newest: Int? = nil) -> [String] {
         var a = commonArgs(settings: s, ffmpegDir: ffmpegDir)
         a += ["--flat-playlist", "--no-warnings", "--ignore-errors",
               "--print", "YTARR_ENT\t%(extractor_key)s\t%(id)s\t%(title)s\t%(duration_string)s\t%(url)s"]
+        if let n = newest, n > 0 { a += ["--playlist-end", String(n)] }
         a += safeTokens(source.extraArgs)
         a.append(playlists ? channelBase(source) + "/playlists" : normalizedURL(source))
         return a

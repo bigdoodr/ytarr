@@ -48,6 +48,13 @@ A source's first check can be **Index only**: it lists everything, marks it all 
 and later checks still grab new uploads. **Browse** on a source lists its videos (and a channel's playlists) with paging,
 a title filter and checkboxes: *Download selected* fetches just those, and playlists can be added as their own sources.
 
+## Monitor only
+Tick **Monitor only (no auto-download)** on a source (it's also on the Add source form) and scheduled checks just look for
+new uploads: they're added to the source's Browse page with a **new** badge, you get one notification, and nothing downloads
+until you tick videos there and press *Download selected*. The first check lists everything without flagging it, so only
+uploads after that show as new. Channels are checked by looking at the newest 100 videos. "Mark all as seen" clears the badges.
+Switching a source back to normal makes it download new uploads again (the backlog stays marked as already had).
+
 ## YouTube rate limits
 Downloads are paced (a pause between requests and between videos, set in Settings). If YouTube still starts refusing
 ("rate-limited by YouTube", or a "not a bot" check), YTArr stops the run at once and pauses all work for 60 minutes

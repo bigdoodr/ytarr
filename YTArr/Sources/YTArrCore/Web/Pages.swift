@@ -55,15 +55,17 @@ enum Pages {
             vidSection = "<h2>Videos</h2><p class=mut>No videos listed yet. Use \"Scan videos\" above; nothing is downloaded by scanning.</p>"
         } else {
             let have = videos.filter(\.downloaded).count
+            let fresh = videos.filter { $0.isNew == true }.count
             let rows = videos.map { v in
                 """
                 <tr data-t="\(H.esc(v.title.lowercased()))"><td><input type="checkbox" name="v" value="\(H.esc(v.id))"></td>\
                 <td>\(H.esc(v.title))</td><td>\(H.esc(v.duration))</td>\
-                <td>\(v.downloaded ? "<span class=\"pill ok\">downloaded</span>" : "")</td></tr>
+                <td>\(v.downloaded ? "<span class=\"pill ok\">downloaded</span>" : (v.isNew == true ? "<span class=\"pill\">new</span>" : ""))</td></tr>
                 """
             }.joined()
             vidSection = """
-            <h2>Videos (\(videos.count), \(have) downloaded)</h2>
+            <h2>Videos (\(videos.count), \(have) downloaded\(fresh > 0 ? ", \(fresh) new" : ""))</h2>
+            \(fresh > 0 ? "<form method=\"post\" action=\"/sources/\(id)/seen\" style=\"margin-bottom:8px\"><button>Mark all as seen</button></form>" : "")
             <form method="post" action="/sources/\(id)/download">
             \(pagerControls("vids", submit: "Download selected"))
             <table id="vids"><tr><th></th><th>Title</th><th>Length</th><th></th></tr>\(rows)</table>
@@ -181,6 +183,7 @@ enum Pages {
         \(H.input("Folder", "destination", src.destination, hint: "Where this source's files go. Blank = library root / profile name. Use a full path (or ~/...) to put them anywhere, e.g. a Jellyfin or Audiobookshelf library folder; the profile's file name template adds subfolders inside it."))
         \(mediaField("Jellyfin library", "jellyfinLibrary", "Jellyfin", current: src.jellyfinLibraryID, jellyfin))
         \(mediaField("Audiobookshelf library", "absLibrary", "Audiobookshelf", current: src.absLibraryID, audiobookshelf))
+        \(H.check("Monitor only (no auto-download)", "monitorOnly", src.monitorOnly ?? false))
         \(H.select("Check every", "interval", ivOpts, selected: String(src.intervalMinutes)))
         \(H.select("First check", "backfill", [("nothing", "Index only - download nothing, I'll pick videos"), ("fromNow", "Only new videos from now on"), ("latest", "Newest N videos, then new ones"), ("all", "Everything")], selected: src.backfillMode.rawValue))
         \(H.input("N (for 'Newest N')", "count", String(src.backfillCount), type: "number"))

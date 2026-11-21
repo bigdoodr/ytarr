@@ -107,7 +107,24 @@ public actor Store {
         var entries = catalog(id, .videos)
         guard !entries.isEmpty else { return }
         let set = Set(ids)
-        for i in entries.indices where set.contains(entries[i].id) { entries[i].downloaded = true }
+        for i in entries.indices where set.contains(entries[i].id) { entries[i].downloaded = true; entries[i].isNew = nil }
+        writeCatalog(id, .videos, entries)
+    }
+
+    /// Adds videos we haven't listed before to the front of the catalog, flagged as new. Returns just those.
+    public func mergeNew(_ id: UUID, _ listed: [CatalogEntry]) -> [CatalogEntry] {
+        let current = catalog(id, .videos)
+        let known = Set(current.map(\.id))
+        let fresh = listed.filter { !known.contains($0.id) }.map { e -> CatalogEntry in var e = e; e.isNew = true; return e }
+        if !fresh.isEmpty { writeCatalog(id, .videos, fresh + current) }
+        return fresh
+    }
+
+    /// Clears the "new" flag on every video of a source.
+    public func clearNew(_ id: UUID) {
+        var entries = catalog(id, .videos)
+        guard entries.contains(where: { $0.isNew == true }) else { return }
+        for i in entries.indices { entries[i].isNew = nil }
         writeCatalog(id, .videos, entries)
     }
 
